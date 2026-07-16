@@ -1,0 +1,54 @@
+{
+  "name": "auto-index-barrel",
+  "displayName": "Auto Index Barrel",
+  "description": "Automatically maintains existing TypeScript index.ts barrel files.",
+  "version": "0.0.1",
+  "publisher": "your-publisher-name",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "autoIndexBarrel.regenerateFolder",
+        "title": "Auto Barrel: Regenerate index.ts"
+      },
+      {
+        "command": "autoIndexBarrel.regenerateAll",
+        "title": "Auto Barrel: Regenerate All index.ts Files"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "autoIndexBarrel.regenerateFolder",
+          "when": "explorerResourceIsFolder",
+          "group": "autoBarrel@1"
+        },
+        {
+          "command": "autoIndexBarrel.regenerateAll",
+          "when": "explorerResourceIsFolder",
+          "group": "autoBarrel@2"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.20.1",
+    "@types/vscode": "^1.96.0",
+    "typescript": "^5.7.2"
+  }
+}
