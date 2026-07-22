@@ -1,7 +1,10 @@
 import * as vscode from "vscode";
 
 import {
+  createMissingBarrels,
+  getFolderName,
   hasNearbyBarrel,
+  isDirectory,
   isIndexUri,
   isRelevantTypeScriptUri,
   parentUri,
@@ -10,12 +13,18 @@ import {
   regenerateBarrel,
 } from "./barrel-generator";
 
-const COMMAND_REGENERATE_FOLDER = "autoIndexBarrel.regenerateFolder";
+import { updateAllImports, updateImportsInDocument } from "./import-rewriter";
 
 const COMMAND_REGENERATE_ALL = "autoIndexBarrel.regenerateAll";
 
+const COMMAND_CREATE_MISSING = "autoIndexBarrel.createMissingBarrels";
+
+const COMMAND_REGENERATE_ALL_IMPORTS = "autoIndexBarrel.regenerateAllImports";
+
+const CONFIGURATION_SECTION = "autoIndexBarrel";
+
 const FILE_CHANGE_DEBOUNCE_MS = 250;
-const MOVE_FIRST_PASS_DELAY_MS = 150;
+const STRUCTURE_CHANGE_DELAY_MS = 150;
 const MOVE_FINAL_PASS_DELAY_MS = 800;
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -24,11 +33,12 @@ export function activate(context: vscode.ExtensionContext): void {
   const pendingUpdates = new Map<string, NodeJS.Timeout>();
 
   /*
-   * There is intentionally no separate index.ts watcher.
-   *
-   * Watching and saving generated index.ts files caused the extension
-   * to react to its own writes and enter an infinite loop.
+   * Prevents recursive saves when import rewriting modifies
+   * and saves the same document.
    */
+  const importRewriteInProgress = new Set<string>();
+  const barrelRewriteInProgress = new Set<string>();
+
   const typescriptWatcher = vscode.workspace.createFileSystemWatcher(
     "**/*.ts",
     false,
@@ -36,13 +46,14 @@ export function activate(context: vscode.ExtensionContext): void {
     false,
   );
 
+  /*
+   * A TypeScript file or index.ts was created.
+   */
   const createDisposable = typescriptWatcher.onDidCreate((uri) => {
     if (isIndexUri(uri)) {
-      const barrelFolder = parentUri(uri);
-
-      scheduleDirectBarrelCreation(
-        barrelFolder,
-        MOVE_FIRST_PASS_DELAY_MS,
+      scheduleDirectBarrelUpdate(
+        parentUri(uri),
+        STRUCTURE_CHANGE_DELAY_MS,
         pendingUpdates,
         output,
       );
@@ -56,18 +67,20 @@ export function activate(context: vscode.ExtensionContext): void {
 
     scheduleAffectedUpdate(
       [uri],
-      MOVE_FIRST_PASS_DELAY_MS,
+      STRUCTURE_CHANGE_DELAY_MS,
       pendingUpdates,
       output,
-      "create",
+      "file-create",
     );
   });
 
+  /*
+   * An existing TypeScript file changed.
+   *
+   * This listener maintains nearby existing barrels.
+   * Import rewriting is handled separately by onDidSaveTextDocument.
+   */
   const changeDisposable = typescriptWatcher.onDidChange(async (uri) => {
-    /*
-     * index.ts is excluded by isRelevantTypeScriptUri(), so the
-     * extension does not react to its own generated saves.
-     */
     if (!isRelevantTypeScriptUri(uri)) {
       return;
     }
@@ -81,10 +94,13 @@ export function activate(context: vscode.ExtensionContext): void {
       FILE_CHANGE_DEBOUNCE_MS,
       pendingUpdates,
       output,
-      "change",
+      "file-change",
     );
   });
 
+  /*
+   * A TypeScript file was deleted.
+   */
   const deleteDisposable = typescriptWatcher.onDidDelete((uri) => {
     if (!isRelevantTypeScriptUri(uri)) {
       return;
@@ -92,36 +108,51 @@ export function activate(context: vscode.ExtensionContext): void {
 
     scheduleAffectedUpdate(
       [uri],
-      MOVE_FIRST_PASS_DELAY_MS,
+      STRUCTURE_CHANGE_DELAY_MS,
       pendingUpdates,
       output,
-      "delete",
+      "file-delete",
     );
   });
 
-  const renameDisposable = vscode.workspace.onDidRenameFiles((event) => {
-    const changedUris = event.files.flatMap((file) => [
-      file.oldUri,
-      file.newUri,
+  /*
+   * Handles folders created through the VS Code Explorer.
+   *
+   * Only newly created folders whose names appear in
+   * autoCreateFolderNames receive a barrel automatically.
+   */
+  const createFilesDisposable = vscode.workspace.onDidCreateFiles(
+    async (event) => {
+      for (const uri of event.files) {
+        await createBarrelForMatchingFolder(uri, output);
+      }
+    },
+  );
+
+  /*
+   * Handles files and folders that were renamed or moved.
+   */
+  const renameDisposable = vscode.workspace.onDidRenameFiles(async (event) => {
+    const changedUris = event.files.flatMap((item) => [
+      item.oldUri,
+      item.newUri,
     ]);
 
     /*
-     * First pass updates the barrels shortly after the filesystem move.
+     * The first pass updates most moved-file cases quickly.
      */
     scheduleAffectedUpdate(
       changedUris,
-      MOVE_FIRST_PASS_DELAY_MS,
+      STRUCTURE_CHANGE_DELAY_MS,
       pendingUpdates,
       output,
       "rename-first",
     );
 
     /*
-     * VS Code may update imports after the rename event, sometimes
-     * temporarily changing a barrel to ../something.
-     *
-     * This second pass runs after VS Code has finished those updates and
-     * rebuilds both old and new barrels from their real folder contents.
+     * VS Code may update imports after the rename event.
+     * The delayed final pass makes sure barrel contents use
+     * the final paths.
      */
     scheduleAffectedUpdate(
       changedUris,
@@ -130,39 +161,108 @@ export function activate(context: vscode.ExtensionContext): void {
       output,
       "rename-final",
     );
+
+    for (const item of event.files) {
+      await createBarrelForMatchingFolder(item.newUri, output);
+    }
   });
 
-  const regenerateFolderCommand = vscode.commands.registerCommand(
-    COMMAND_REGENERATE_FOLDER,
-    async (selectedUri?: vscode.Uri) => {
-      const folderUri = await resolveSelectedFolder(selectedUri);
+  const saveBarrelDisposable = vscode.workspace.onDidSaveTextDocument(
+    async (document) => {
+      if (!isIndexUri(document.uri)) {
+        return;
+      }
 
-      if (!folderUri) {
-        vscode.window.showErrorMessage(
-          "Auto Index Barrel: no folder was selected.",
-        );
+      const documentKey = document.uri.toString();
+
+      if (barrelRewriteInProgress.has(documentKey)) {
         return;
       }
 
       try {
-        await regenerateBarrel(folderUri, true);
+        barrelRewriteInProgress.add(documentKey);
 
-        vscode.window.showInformationMessage(
-          "Auto Index Barrel: index.ts regenerated.",
-        );
+        await regenerateBarrel(parentUri(document.uri), false);
+
+        output.appendLine(`Regenerated saved barrel: ${document.uri.fsPath}`);
       } catch (error) {
-        showError(output, "Could not regenerate index.ts", error);
+        logError(output, `Could not regenerate ${document.uri.fsPath}`, error);
+      } finally {
+        barrelRewriteInProgress.delete(documentKey);
       }
     },
   );
 
+  /*
+   * Optionally rewrite safe direct imports after a file is saved.
+   */
+  const saveImportsDisposable = vscode.workspace.onDidSaveTextDocument(
+    async (document) => {
+      const documentKey = document.uri.toString();
+
+      if (importRewriteInProgress.has(documentKey)) {
+        return;
+      }
+
+      const configuration = vscode.workspace.getConfiguration(
+        CONFIGURATION_SECTION,
+        document.uri,
+      );
+
+      const rewriteOnSave = configuration.get<boolean>(
+        "rewriteImportsOnSave",
+        true,
+      );
+
+      if (!rewriteOnSave) {
+        return;
+      }
+
+      try {
+        importRewriteInProgress.add(documentKey);
+
+        const changedImports = await updateImportsInDocument(document);
+
+        if (changedImports === 0) {
+          return;
+        }
+
+        /*
+         * updateImportsInDocument applies a WorkspaceEdit,
+         * so the document must be saved again.
+         */
+        const saved = await document.save();
+
+        if (!saved) {
+          throw new Error(`Could not save ${document.uri.fsPath}`);
+        }
+
+        output.appendLine(
+          `Updated ${changedImports} import${
+            changedImports === 1 ? "" : "s"
+          } in ${document.uri.fsPath}.`,
+        );
+      } catch (error) {
+        logError(
+          output,
+          `Could not update imports in ${document.uri.fsPath}`,
+          error,
+        );
+      } finally {
+        importRewriteInProgress.delete(documentKey);
+      }
+    },
+  );
+
+  /*
+   * Regenerates all existing index.ts files.
+   *
+   * It does not create missing barrel files.
+   */
   const regenerateAllCommand = vscode.commands.registerCommand(
     COMMAND_REGENERATE_ALL,
     async (selectedUri?: vscode.Uri) => {
-      const selectedFolder = await resolveSelectedFolder(selectedUri);
-
-      const rootUri =
-        selectedFolder ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+      const rootUri = await resolveCommandRoot(selectedUri);
 
       if (!rootUri) {
         vscode.window.showErrorMessage(
@@ -175,18 +275,116 @@ export function activate(context: vscode.ExtensionContext): void {
         const count = await vscode.window.withProgress(
           {
             location: vscode.ProgressLocation.Notification,
-            title: "Regenerating index.ts files",
+            title: "Auto Index Barrel: regenerating existing barrels",
           },
           () => regenerateAllBarrels(rootUri),
         );
 
         vscode.window.showInformationMessage(
-          `Auto Index Barrel: regenerated ${count} index.ts file${
+          `Auto Index Barrel: regenerated ${count} existing barrel${
             count === 1 ? "" : "s"
           }.`,
         );
       } catch (error) {
-        showError(output, "Could not regenerate all index.ts files", error);
+        showError(output, "Could not regenerate existing barrels", error);
+      }
+    },
+  );
+
+  /*
+   * Creates index.ts in existing folders whose names match
+   * autoCreateFolderNames.
+   */
+  const createMissingCommand = vscode.commands.registerCommand(
+    COMMAND_CREATE_MISSING,
+    async (selectedUri?: vscode.Uri) => {
+      const rootUri = await resolveCommandRoot(selectedUri);
+
+      if (!rootUri) {
+        vscode.window.showErrorMessage(
+          "Auto Index Barrel: no workspace is open.",
+        );
+        return;
+      }
+
+      const folderNames = getConfiguredFolderNames(rootUri);
+
+      if (folderNames.length === 0) {
+        vscode.window.showInformationMessage(
+          "Auto Index Barrel: no auto-create folder names are configured.",
+        );
+        return;
+      }
+
+      try {
+        const count = await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: "Auto Index Barrel: creating missing barrels",
+          },
+          () => createMissingBarrels(rootUri, folderNames),
+        );
+
+        vscode.window.showInformationMessage(
+          `Auto Index Barrel: created ${count} missing barrel${
+            count === 1 ? "" : "s"
+          }.`,
+        );
+      } catch (error) {
+        showError(output, "Could not create missing barrels", error);
+      }
+    },
+  );
+
+  /*
+   * Rewrites safe imports across the selected folder/project.
+   */
+  const regenerateAllImportsCommand = vscode.commands.registerCommand(
+    COMMAND_REGENERATE_ALL_IMPORTS,
+    async (selectedUri?: vscode.Uri) => {
+      const rootUri = await resolveCommandRoot(selectedUri);
+
+      if (!rootUri) {
+        vscode.window.showErrorMessage(
+          "Auto Index Barrel: no workspace is open.",
+        );
+        return;
+      }
+
+      const confirmation = await vscode.window.showWarningMessage(
+        "Update all safe TypeScript imports under the selected folder?",
+        {
+          modal: true,
+          detail:
+            "Direct imports will be changed to barrel imports when a matching index.ts exports the imported file. Changed files will be saved.",
+        },
+        "Update Imports",
+      );
+
+      if (confirmation !== "Update Imports") {
+        return;
+      }
+
+      try {
+        const result = await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: "Auto Index Barrel: updating imports",
+            cancellable: true,
+          },
+          (progress, cancellationToken) =>
+            updateAllImports(rootUri, progress, cancellationToken),
+        );
+
+        vscode.window.showInformationMessage(
+          `Auto Index Barrel: updated ${result.changedImports} import${
+            result.changedImports === 1 ? "" : "s"
+          } across ${result.changedFiles} file${
+            result.changedFiles === 1 ? "" : "s"
+          }.`,
+        );
+      } catch (error) {
+        showError(output, "Could not regenerate project imports", error);
       }
     },
   );
@@ -197,9 +395,13 @@ export function activate(context: vscode.ExtensionContext): void {
     createDisposable,
     changeDisposable,
     deleteDisposable,
+    createFilesDisposable,
     renameDisposable,
-    regenerateFolderCommand,
+    saveImportsDisposable,
     regenerateAllCommand,
+    createMissingCommand,
+    regenerateAllImportsCommand,
+    saveBarrelDisposable,
     {
       dispose: () => {
         for (const timeout of pendingUpdates.values()) {
@@ -207,6 +409,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
 
         pendingUpdates.clear();
+        importRewriteInProgress.clear();
       },
     },
   );
@@ -215,7 +418,54 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {
-  // Disposables are handled by context.subscriptions.
+  // Resources are disposed through context.subscriptions.
+}
+
+async function createBarrelForMatchingFolder(
+  uri: vscode.Uri,
+  output: vscode.OutputChannel,
+): Promise<void> {
+  if (!(await isDirectory(uri))) {
+    return;
+  }
+
+  const configuredNames = getConfiguredFolderNames(uri);
+
+  if (configuredNames.length === 0) {
+    return;
+  }
+
+  const configuredNameSet = new Set(
+    configuredNames.map((name) => name.toLowerCase()),
+  );
+
+  const folderName = getFolderName(uri).toLowerCase();
+
+  if (!configuredNameSet.has(folderName)) {
+    return;
+  }
+
+  try {
+    await regenerateBarrel(uri, true);
+
+    output.appendLine(
+      `Automatically created or populated barrel in ${uri.fsPath}.`,
+    );
+  } catch (error) {
+    logError(output, `Could not auto-create barrel in ${uri.fsPath}`, error);
+  }
+}
+
+function getConfiguredFolderNames(resourceUri?: vscode.Uri): string[] {
+  const configuration = vscode.workspace.getConfiguration(
+    CONFIGURATION_SECTION,
+    resourceUri,
+  );
+
+  return configuration
+    .get<string[]>("autoCreateFolderNames", [])
+    .map((name) => name.trim())
+    .filter(Boolean);
 }
 
 function scheduleAffectedUpdate(
@@ -242,17 +492,38 @@ function scheduleAffectedUpdate(
 
   replacePendingTimeout(key, delayMs, pendingUpdates, async () => {
     try {
-      const updatedCount = await regenerateAffectedBarrels(relevantUris);
+      const count = await regenerateAffectedBarrels(relevantUris);
 
-      if (updatedCount > 0) {
+      if (count > 0) {
         output.appendLine(
-          `Updated ${updatedCount} barrel folder${
-            updatedCount === 1 ? "" : "s"
-          } (${keyPrefix}).`,
+          `Updated ${count} affected barrel${count === 1 ? "" : "s"}.`,
         );
       }
     } catch (error) {
-      logError(output, "Could not update affected barrel files", error);
+      logError(output, "Could not update affected barrels", error);
+    }
+  });
+}
+
+function scheduleDirectBarrelUpdate(
+  folderUri: vscode.Uri,
+  delayMs: number,
+  pendingUpdates: Map<string, NodeJS.Timeout>,
+  output: vscode.OutputChannel,
+): void {
+  const key = `index-create:${folderUri.toString()}`;
+
+  replacePendingTimeout(key, delayMs, pendingUpdates, async () => {
+    try {
+      await regenerateBarrel(folderUri, false);
+
+      output.appendLine(`Populated new index.ts in ${folderUri.fsPath}.`);
+    } catch (error) {
+      logError(
+        output,
+        `Could not populate index.ts in ${folderUri.fsPath}`,
+        error,
+      );
     }
   });
 }
@@ -263,10 +534,10 @@ function replacePendingTimeout(
   pendingUpdates: Map<string, NodeJS.Timeout>,
   callback: () => Promise<void>,
 ): void {
-  const existingTimeout = pendingUpdates.get(key);
+  const existing = pendingUpdates.get(key);
 
-  if (existingTimeout) {
-    clearTimeout(existingTimeout);
+  if (existing) {
+    clearTimeout(existing);
   }
 
   const timeout = setTimeout(async () => {
@@ -276,8 +547,8 @@ function replacePendingTimeout(
       await callback();
     } catch {
       /*
-       * Individual callbacks already log their errors.
-       * This prevents unhandled promise rejections.
+       * Callback-specific errors are already logged
+       * by the callback itself.
        */
     }
   }, delayMs);
@@ -285,11 +556,23 @@ function replacePendingTimeout(
   pendingUpdates.set(key, timeout);
 }
 
+async function resolveCommandRoot(
+  selectedUri?: vscode.Uri,
+): Promise<vscode.Uri | undefined> {
+  const selectedFolder = await resolveSelectedFolder(selectedUri);
+
+  if (selectedFolder) {
+    return selectedFolder;
+  }
+
+  return vscode.workspace.workspaceFolders?.[0]?.uri;
+}
+
 async function resolveSelectedFolder(
   selectedUri?: vscode.Uri,
 ): Promise<vscode.Uri | undefined> {
   if (!selectedUri) {
-    return vscode.workspace.workspaceFolders?.[0]?.uri;
+    return undefined;
   }
 
   try {
@@ -303,31 +586,6 @@ async function resolveSelectedFolder(
   } catch {
     return parentUri(selectedUri);
   }
-}
-
-function scheduleDirectBarrelCreation(
-  barrelFolderUri: vscode.Uri,
-  delayMs: number,
-  pendingUpdates: Map<string, NodeJS.Timeout>,
-  output: vscode.OutputChannel,
-): void {
-  const key = `create-index:${barrelFolderUri.toString()}`;
-
-  replacePendingTimeout(key, delayMs, pendingUpdates, async () => {
-    try {
-      const regenerated = await regenerateBarrel(barrelFolderUri, false);
-
-      if (regenerated) {
-        output.appendLine(`Filled new index.ts in ${barrelFolderUri.fsPath}.`);
-      }
-    } catch (error) {
-      logError(
-        output,
-        `Could not fill new index.ts in ${barrelFolderUri.fsPath}`,
-        error,
-      );
-    }
-  });
 }
 
 function showError(

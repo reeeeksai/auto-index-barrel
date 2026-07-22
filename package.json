@@ -1,54 +1,128 @@
 {
   "name": "auto-index-barrel",
   "displayName": "Auto Index Barrel",
-  "description": "Automatically maintains existing TypeScript index.ts barrel files.",
+  "description": "Automatically creates, maintains, and updates TypeScript barrel index.ts files and imports.",
   "version": "0.0.1",
   "publisher": "your-publisher-name",
   "engines": {
     "vscode": "^1.96.0"
   },
   "categories": [
-    "Other"
+    "Other",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "typescript",
+    "barrel",
+    "index.ts",
+    "imports",
+    "angular"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onCommand:autoIndexBarrel.regenerateAll",
+    "onCommand:autoIndexBarrel.createMissingBarrels",
+    "onCommand:autoIndexBarrel.regenerateAllImports"
   ],
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "autoIndexBarrel.regenerateFolder",
-        "title": "Auto Barrel: Regenerate index.ts"
+        "command": "autoIndexBarrel.regenerateAll",
+        "title": "Regenerate All Existing Barrels",
+        "category": "Auto Index Barrel"
       },
       {
-        "command": "autoIndexBarrel.regenerateAll",
-        "title": "Auto Barrel: Regenerate All index.ts Files"
+        "command": "autoIndexBarrel.createMissingBarrels",
+        "title": "Create Missing Barrels",
+        "category": "Auto Index Barrel"
+      },
+      {
+        "command": "autoIndexBarrel.regenerateAllImports",
+        "title": "Regenerate All Imports",
+        "category": "Auto Index Barrel"
       }
     ],
+    "configuration": {
+      "title": "Auto Index Barrel",
+      "properties": {
+        "autoIndexBarrel.autoCreateFolderNames": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "markdownDescription": "Folder names that automatically receive an `index.ts` when newly created, renamed, or moved. Existing folders remain unchanged until **Create Missing Barrels** is run. Leave empty to disable automatic barrel creation.",
+          "scope": "resource",
+          "order": 1
+        },
+        "autoIndexBarrel.rewriteImportsOnSave": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically rewrites safe direct TypeScript imports to use an available barrel when the importing file is saved.",
+          "scope": "resource",
+          "order": 2
+        }
+      }
+    },
     "menus": {
       "explorer/context": [
         {
-          "command": "autoIndexBarrel.regenerateFolder",
-          "when": "explorerResourceIsFolder",
-          "group": "autoBarrel@1"
-        },
-        {
           "command": "autoIndexBarrel.regenerateAll",
           "when": "explorerResourceIsFolder",
-          "group": "autoBarrel@2"
+          "group": "autoIndexBarrel@1"
+        },
+        {
+          "command": "autoIndexBarrel.createMissingBarrels",
+          "when": "explorerResourceIsFolder",
+          "group": "autoIndexBarrel@2"
+        },
+        {
+          "command": "autoIndexBarrel.regenerateAllImports",
+          "when": "explorerResourceIsFolder",
+          "group": "autoIndexBarrel@3"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "autoIndexBarrel.regenerateAll"
+        },
+        {
+          "command": "autoIndexBarrel.createMissingBarrels"
+        },
+        {
+          "command": "autoIndexBarrel.regenerateAllImports"
         }
       ]
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "watch": "npm-run-all --parallel watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p ./tsconfig.test.json --outDir out",
+    "watch-tests": "tsc -p ./tsconfig.test.json --watch --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "dependencies": {
+    "typescript": "^5.7.2"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/mocha": "^10.0.10",
-    "@types/node": "^22.20.1",
+    "@types/node": "22.x",
     "@types/vscode": "^1.96.0",
-    "typescript": "^5.7.2"
+    "@vscode/test-cli": "^0.0.11",
+    "@vscode/test-electron": "^2.4.1",
+    "esbuild": "^0.24.2",
+    "eslint": "^9.39.5",
+    "npm-run-all": "^4.1.5",
+    "typescript-eslint": "^8.0.0"
   }
 }
