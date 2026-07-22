@@ -3,7 +3,7 @@
   "displayName": "Auto Index Barrel",
   "description": "Automatically creates, maintains, and updates TypeScript barrel index.ts files and imports.",
   "version": "0.0.1",
-  "publisher": "your-publisher-name",
+  "publisher": "reeeeksai",
   "engines": {
     "vscode": "^1.96.0"
   },
@@ -120,6 +120,7 @@
     "@types/vscode": "^1.96.0",
     "@vscode/test-cli": "^0.0.11",
     "@vscode/test-electron": "^2.4.1",
+    "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.24.2",
     "eslint": "^9.39.5",
     "npm-run-all": "^4.1.5",
