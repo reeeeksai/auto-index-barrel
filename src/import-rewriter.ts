@@ -22,20 +22,10 @@ interface ImportReplacement {
   newModuleSpecifier: string;
 }
 
-interface BarrelCandidate {
-  folderUri: vscode.Uri;
-  indexUri: vscode.Uri;
-}
-
 interface ProjectConfiguration {
   configFilePath: string;
   options: ts.CompilerOptions;
 }
-
-const projectConfigurationCache = new Map<
-  string,
-  ProjectConfiguration | undefined
->();
 
 /**
  * Updates imports inside one TypeScript document.
@@ -49,9 +39,14 @@ export async function updateImportsInDocument(
     return 0;
   }
 
+  const version = document.version;
   const replacements = await findImportReplacements(document);
 
-  if (replacements.length === 0) {
+  if (
+    document.isClosed ||
+    document.version !== version ||
+    replacements.length === 0
+  ) {
     return 0;
   }
 
@@ -89,8 +84,6 @@ export async function updateAllImports(
   changedFiles: number;
   changedImports: number;
 }> {
-  projectConfigurationCache.clear();
-
   const files = await vscode.workspace.findFiles(
     new vscode.RelativePattern(rootUri, "**/*.{ts,tsx,mts,cts}"),
     EXCLUDED_GLOB,
@@ -125,12 +118,6 @@ export async function updateAllImports(
 
     changedFiles++;
     changedImports += changedInFile;
-
-    const saved = await document.save();
-
-    if (!saved) {
-      throw new Error(`Could not save ${fileUri.fsPath}`);
-    }
   }
 
   return {
@@ -142,6 +129,7 @@ export async function updateAllImports(
 async function findImportReplacements(
   document: vscode.TextDocument,
 ): Promise<ImportReplacement[]> {
+  const version = document.version;
   const sourceText = document.getText();
 
   const sourceFile = ts.createSourceFile(
@@ -155,6 +143,7 @@ async function findImportReplacements(
   const projectConfiguration = findProjectConfiguration(document.uri.fsPath);
 
   const replacements: ImportReplacement[] = [];
+  const barrelFiles = new Map<string, Thenable<vscode.Uri[]>>();
 
   for (const statement of sourceFile.statements) {
     if (!ts.isImportDeclaration(statement)) {
@@ -196,41 +185,69 @@ async function findImportReplacements(
       continue;
     }
 
-    const barrel = await findExportingBarrel(
-      document.uri,
-      targetFileUri,
-      projectConfiguration,
-    );
-
-    if (!barrel) {
+    const names = getImportedNames(statement.importClause);
+    if (names.length === 0 || isIndexFile(targetFileUri)) {
       continue;
     }
 
-    const importedNames = getImportedNames(statement.importClause);
+    const workspaceKey = workspaceFolder.uri.toString();
+    let indexes = barrelFiles.get(workspaceKey);
+    if (!indexes) {
+      indexes = vscode.workspace.findFiles(
+        new vscode.RelativePattern(workspaceFolder.uri, "**/index.ts"),
+        EXCLUDED_GLOB,
+      );
+      barrelFiles.set(workspaceKey, indexes);
+    }
+    const candidates: { indexUri: vscode.Uri; specifier: string }[] = [];
+    for (const indexUri of await indexes) {
+      const folder = parentUri(indexUri);
+      if (isInsideOrEqual(folder, document.uri)) {
+        continue;
+      }
 
+      const specifier = createBarrelModuleSpecifier(
+        document.uri,
+        originalSpecifier,
+        targetFileUri,
+        folder,
+      );
+      if (!specifier || specifier === originalSpecifier) {
+        continue;
+      }
+
+      const resolved = await resolveImportedFile(
+        document.uri,
+        specifier,
+        projectConfiguration,
+      );
+      if (
+        resolved &&
+        sameUri(resolved, indexUri) &&
+        (await barrelDirectlyForwards(indexUri, targetFileUri, names))
+      ) {
+        candidates.push({ indexUri, specifier });
+      }
+    }
+
+    if (candidates.length !== 1) {
+      continue;
+    }
+
+    const [{ indexUri, specifier: newSpecifier }] = candidates;
     if (
-      importedNames.length > 0 &&
-      !(await targetExportsAnyImportedName(targetFileUri, importedNames))
+      !exportsSameSymbols(
+        targetFileUri,
+        indexUri,
+        names,
+        projectConfiguration?.options,
+      )
     ) {
       continue;
     }
 
-    const newSpecifier = createBarrelModuleSpecifier(
-      document.uri,
-      originalSpecifier,
-      targetFileUri,
-      barrel.folderUri,
-    );
-
-    if (!newSpecifier) {
-      continue;
-    }
-
-    if (
-      normalizeModuleSpecifier(newSpecifier) ===
-      normalizeModuleSpecifier(originalSpecifier)
-    ) {
-      continue;
+    if (document.isClosed || document.version !== version) {
+      return [];
     }
 
     const literalStart = statement.moduleSpecifier.getStart(sourceFile);
@@ -254,133 +271,146 @@ async function findImportReplacements(
   return replacements;
 }
 
-async function findExportingBarrel(
-  importerUri: vscode.Uri,
-  importedFileUri: vscode.Uri,
-  projectConfiguration: ProjectConfiguration | undefined,
-): Promise<BarrelCandidate | undefined> {
-  const workspaceFolder = vscode.workspace.getWorkspaceFolder(importedFileUri);
-
-  if (!workspaceFolder) {
-    return undefined;
-  }
-
-  let candidateFolder = parentUri(importedFileUri);
-
-  while (isInsideOrEqual(workspaceFolder.uri, candidateFolder)) {
-    const indexUri = vscode.Uri.joinPath(candidateFolder, INDEX_FILE_NAME);
-
-    if (await isFile(indexUri)) {
-      /*
-       * A file inside components/, services/, etc.
-       * should not import through its own barrel.
-       */
-      if (!isInsideOrEqual(candidateFolder, importerUri)) {
-        const exportsTarget = await barrelExportsFile(
-          indexUri,
-          importedFileUri,
-          projectConfiguration,
-        );
-
-        if (exportsTarget) {
-          return {
-            folderUri: candidateFolder,
-            indexUri,
-          };
-        }
-      }
-    }
-
-    const nextFolder = parentUri(candidateFolder);
-
-    if (sameUri(nextFolder, candidateFolder)) {
-      break;
-    }
-
-    candidateFolder = nextFolder;
-  }
-
-  const barrelIndexFiles = await vscode.workspace.findFiles(
-    new vscode.RelativePattern(workspaceFolder.uri, "**/index.ts"),
-    EXCLUDED_GLOB,
-  );
-
-  barrelIndexFiles.sort((left, right) =>
-    left.fsPath.localeCompare(right.fsPath, undefined, {
-      sensitivity: "base",
-      numeric: true,
-    }),
-  );
-
-  for (const indexUri of barrelIndexFiles) {
-    const barrelFolder = parentUri(indexUri);
-
-    if (isInsideOrEqual(barrelFolder, importerUri)) {
-      continue;
-    }
-
-    if (
-      await barrelExportsFile(indexUri, importedFileUri, projectConfiguration)
-    ) {
-      return {
-        folderUri: barrelFolder,
-        indexUri,
-      };
-    }
-  }
-
-  return undefined;
+function isIndexFile(uri: vscode.Uri): boolean {
+  return /\/index\.(?:tsx?|mts|cts)$/i.test(uri.path);
 }
 
-async function barrelExportsFile(
+function openContents(uri: vscode.Uri): string | undefined {
+  return vscode.workspace.textDocuments
+    .find((document) => sameUri(document.uri, uri))
+    ?.getText();
+}
+
+async function barrelDirectlyForwards(
   indexUri: vscode.Uri,
-  targetFileUri: vscode.Uri,
-  projectConfiguration: ProjectConfiguration | undefined,
+  targetUri: vscode.Uri,
+  names: readonly string[],
 ): Promise<boolean> {
-  let sourceText: string;
-
+  const remaining = new Set(names);
+  const openText = openContents(indexUri);
+  let text: string;
   try {
-    const bytes = await vscode.workspace.fs.readFile(indexUri);
-
-    sourceText = new TextDecoder().decode(bytes);
+    text =
+      openText ??
+      new TextDecoder().decode(await vscode.workspace.fs.readFile(indexUri));
   } catch {
     return false;
   }
 
-  const sourceFile = ts.createSourceFile(
+  const source = ts.createSourceFile(
     indexUri.fsPath,
-    sourceText,
+    text,
     ts.ScriptTarget.Latest,
     true,
-    ts.ScriptKind.TS,
   );
-
-  for (const statement of sourceFile.statements) {
-    if (!ts.isExportDeclaration(statement)) {
-      continue;
-    }
-
+  const config = findProjectConfiguration(indexUri.fsPath);
+  for (const statement of source.statements) {
     if (
+      !ts.isExportDeclaration(statement) ||
+      statement.isTypeOnly ||
       !statement.moduleSpecifier ||
-      !ts.isStringLiteralLike(statement.moduleSpecifier)
+      !ts.isStringLiteral(statement.moduleSpecifier)
     ) {
       continue;
     }
 
-    const exportedSpecifier = statement.moduleSpecifier.text;
-
-    const resolvedExport = await resolveImportedFile(
+    const resolved = await resolveImportedFile(
       indexUri,
-      exportedSpecifier,
-      projectConfiguration,
+      statement.moduleSpecifier.text,
+      config,
     );
+    if (!resolved || !sameUri(resolved, targetUri)) {
+      continue;
+    }
 
-    if (resolvedExport && sameFile(resolvedExport, targetFileUri)) {
-      return true;
+    if (!statement.exportClause) {
+      for (const name of remaining) {
+        if (name !== "default") {
+          remaining.delete(name);
+        }
+      }
+    } else if (ts.isNamedExports(statement.exportClause)) {
+      for (const element of statement.exportClause.elements) {
+        if (
+          !element.isTypeOnly &&
+          (!element.propertyName ||
+            element.propertyName.text === element.name.text)
+        ) {
+          remaining.delete(element.name.text);
+        }
+      }
     }
   }
 
-  return false;
+  return remaining.size === 0;
+}
+
+function exportsSameSymbols(
+  targetUri: vscode.Uri,
+  indexUri: vscode.Uri,
+  names: readonly string[],
+  options: ts.CompilerOptions = {},
+): boolean {
+  const compilerOptions = {
+    ...options,
+    noResolve: false,
+    noLib: true,
+    types: [],
+  };
+  const host = ts.createCompilerHost(compilerOptions);
+  const readFile = host.readFile.bind(host);
+  host.readFile = (fileName) =>
+    openContents(vscode.Uri.file(fileName)) ?? readFile(fileName);
+
+  const program = ts.createProgram(
+    [targetUri.fsPath, indexUri.fsPath],
+    compilerOptions,
+    host,
+  );
+  const target = program.getSourceFile(targetUri.fsPath);
+  const barrel = program.getSourceFile(indexUri.fsPath);
+  if (
+    !target ||
+    !barrel ||
+    program
+      .getSemanticDiagnostics(barrel)
+      .some((diagnostic) => diagnostic.code === 2308)
+  ) {
+    return false;
+  }
+
+  const checker = program.getTypeChecker();
+  const exportsOf = (source: ts.SourceFile) => {
+    const module = checker.getSymbolAtLocation(source);
+    return new Map(
+      module &&
+        checker
+          .getExportsOfModule(module)
+          .map((symbol) => [symbol.getName(), symbol] as const),
+    );
+  };
+  const targetExports = exportsOf(target);
+  const barrelExports = exportsOf(barrel);
+  const originalSymbol = (symbol: ts.Symbol) =>
+    symbol.flags & ts.SymbolFlags.Alias
+      ? checker.getAliasedSymbol(symbol)
+      : symbol;
+
+  return names.every((name) => {
+    const original = targetExports.get(name);
+    const forwarded = barrelExports.get(name);
+    if (
+      !original ||
+      !forwarded ||
+      forwarded.declarations?.some(ts.isTypeOnlyImportOrExportDeclaration)
+    ) {
+      return false;
+    }
+    const symbol = originalSymbol(original);
+    return Boolean(
+      symbol.declarations?.length && symbol === originalSymbol(forwarded),
+    );
+  });
 }
 
 /**
@@ -408,24 +438,17 @@ async function resolveImportedFile(
    * module resolution behavior.
    */
   if (configuration) {
-    const resolution = ts.resolveModuleName(
+    const result = ts.resolveModuleName(
       moduleSpecifier,
       importerUri.fsPath,
       configuration.options,
       ts.sys,
-    );
-
-    const resolvedFileName = resolution.resolvedModule?.resolvedFileName;
-
-    if (resolvedFileName && !isNodeModulesPath(resolvedFileName)) {
-      const normalizedPath = normalizeResolvedFileName(resolvedFileName);
-
-      const resolvedUri = vscode.Uri.file(normalizedPath);
-
-      if (await isFile(resolvedUri)) {
-        return resolvedUri;
-      }
+    ).resolvedModule;
+    if (!result || isNodeModulesPath(result.resolvedFileName)) {
+      return undefined;
     }
+    const resolvedUri = vscode.Uri.file(result.resolvedFileName);
+    return (await isFile(resolvedUri)) ? resolvedUri : undefined;
   }
 
   /*
@@ -595,37 +618,29 @@ function createNonRelativeBarrelSpecifier(
 function findProjectConfiguration(
   sourceFilePath: string,
 ): ProjectConfiguration | undefined {
-  const sourceDirectory = path.dirname(sourceFilePath);
-
-  const cacheKey = normalizeFsPath(sourceDirectory);
-
-  if (projectConfigurationCache.has(cacheKey)) {
-    return projectConfigurationCache.get(cacheKey);
-  }
-
-  for (const configFileName of CONFIG_FILE_NAMES) {
-    const configFilePath = ts.findConfigFile(
-      sourceDirectory,
-      ts.sys.fileExists,
-      configFileName,
-    );
-
-    if (!configFilePath) {
-      continue;
+  let directory = path.dirname(sourceFilePath);
+  const root = vscode.workspace.getWorkspaceFolder(
+    vscode.Uri.file(sourceFilePath),
+  )?.uri.fsPath;
+  while (true) {
+    for (const name of CONFIG_FILE_NAMES) {
+      const configPath = path.join(directory, name);
+      if (ts.sys.fileExists(configPath)) {
+        const configuration = parseProjectConfiguration(configPath);
+        if (configuration) {
+          return configuration;
+        }
+      }
     }
-
-    const configuration = parseProjectConfiguration(configFilePath);
-
-    if (configuration) {
-      projectConfigurationCache.set(cacheKey, configuration);
-
-      return configuration;
+    const parent = path.dirname(directory);
+    if (
+      parent === directory ||
+      (root && normalizeFsPath(root) === normalizeFsPath(directory))
+    ) {
+      return undefined;
     }
+    directory = parent;
   }
-
-  projectConfigurationCache.set(cacheKey, undefined);
-
-  return undefined;
 }
 
 function parseProjectConfiguration(
@@ -719,12 +734,6 @@ function normalizeModuleSpecifier(value: string): string {
   return value.replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
-function normalizeResolvedFileName(fileName: string): string {
-  return fileName.replace(/\.(?:d\.)?ts$/i, (matched) =>
-    matched.toLowerCase() === ".d.ts" ? matched : matched,
-  );
-}
-
 function normalizeFsPath(value: string): string {
   const normalized = path.normalize(value);
 
@@ -768,13 +777,6 @@ function isInsideOrEqual(parent: vscode.Uri, child: vscode.Uri): boolean {
   );
 }
 
-function sameFile(left: vscode.Uri, right: vscode.Uri): boolean {
-  return sameUri(
-    removeTypeScriptExtension(left),
-    removeTypeScriptExtension(right),
-  );
-}
-
 function removeTypeScriptExtension(uri: vscode.Uri): vscode.Uri {
   return uri.with({
     path: uri.path.replace(/\.(?:tsx?|mts|cts)$/i, ""),
@@ -790,6 +792,13 @@ function sameUri(left: vscode.Uri, right: vscode.Uri): boolean {
 }
 
 function getImportedNames(importClause: ts.ImportClause): string[] {
+  if (
+    importClause.namedBindings &&
+    ts.isNamespaceImport(importClause.namedBindings)
+  ) {
+    return [];
+  }
+
   const names: string[] = [];
 
   if (importClause.name) {
@@ -806,69 +815,6 @@ function getImportedNames(importClause: ts.ImportClause): string[] {
   }
 
   return [...new Set(names)];
-}
-
-async function targetExportsAnyImportedName(
-  targetFileUri: vscode.Uri,
-  importedNames: readonly string[],
-): Promise<boolean> {
-  try {
-    const bytes = await vscode.workspace.fs.readFile(targetFileUri);
-    const sourceFile = ts.createSourceFile(
-      targetFileUri.fsPath,
-      new TextDecoder().decode(bytes),
-      ts.ScriptTarget.Latest,
-      true,
-      getScriptKind(targetFileUri),
-    );
-
-    const exportedNames = new Set<string>();
-
-    for (const statement of sourceFile.statements) {
-      if (ts.isExportDeclaration(statement)) {
-        if (
-          statement.exportClause &&
-          ts.isNamedExports(statement.exportClause)
-        ) {
-          for (const element of statement.exportClause.elements) {
-            exportedNames.add(element.name.text);
-          }
-        }
-        continue;
-      }
-
-      if (ts.isExportAssignment(statement)) {
-        exportedNames.add("default");
-      }
-
-      if (
-        (ts.isVariableStatement(statement) ||
-          ts.isFunctionDeclaration(statement) ||
-          ts.isClassDeclaration(statement) ||
-          ts.isInterfaceDeclaration(statement) ||
-          ts.isTypeAliasDeclaration(statement) ||
-          ts.isEnumDeclaration(statement) ||
-          ts.isModuleDeclaration(statement)) &&
-        statement.modifiers?.some(
-          (modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword,
-        )
-      ) {
-        if (ts.isVariableStatement(statement)) {
-          for (const declaration of statement.declarationList.declarations) {
-            if (ts.isIdentifier(declaration.name)) {
-              exportedNames.add(declaration.name.text);
-            }
-          }
-        } else if (statement.name) {
-          exportedNames.add(statement.name.text);
-        }
-      }
-    }
-
-    return importedNames.some((name) => exportedNames.has(name));
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -891,7 +837,11 @@ export async function previewImportRewritesInDocument(
     return [];
   }
 
+  const version = document.version;
   const replacements = await findImportReplacements(document);
+  if (document.isClosed || document.version !== version) {
+    return [];
+  }
 
   return replacements.map((replacement) => ({
     fileUri: document.uri,

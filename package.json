@@ -38,6 +38,11 @@
         "command": "autoIndexBarrel.regenerateAllImports",
         "title": "Regenerate All Imports",
         "category": "Auto Index Barrel"
+      },
+      {
+        "command": "autoIndexBarrel.regenerateEverything",
+        "title": "Regenerate Everything",
+        "category": "Auto Index Barrel"
       }
     ],
     "configuration": {
@@ -76,6 +81,11 @@
           "command": "autoIndexBarrel.regenerateAllImports",
           "when": "explorerResourceIsFolder",
           "group": "autoIndexBarrel@3"
+        },
+        {
+          "command": "autoIndexBarrel.regenerateEverything",
+          "when": "explorerResourceIsFolder",
+          "group": "autoIndexBarrel@4"
         }
       ],
       "commandPalette": [
@@ -87,6 +97,9 @@
         },
         {
           "command": "autoIndexBarrel.regenerateAllImports"
+        },
+        {
+          "command": "autoIndexBarrel.regenerateEverything"
         }
       ]
     }

@@ -1,4 +1,5 @@
-export * from "./alias-consumer";
-export * from "./consumer";
-export * from "./missing-consumer";
-export * from "./nested/nested.service";
+// Generated exports
+export * from './missing-consumer';
+export * from './nested/nested.service';
+
+// Custom exports

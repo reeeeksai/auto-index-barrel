@@ -33,6 +33,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.CUSTOM_EXPORTS_MARKER = exports.GENERATED_EXPORTS_MARKER = void 0;
 exports.barrelExists = barrelExists;
 exports.isDirectory = isDirectory;
 exports.regenerateBarrel = regenerateBarrel;
@@ -79,6 +80,26 @@ async function isDirectory(uri) {
     }
 }
 async function regenerateBarrel(barrelFolderUri, createIfMissing = false) {
+    const key = barrelFolderUri.toString();
+    const previous = barrelUpdateQueues.get(key) ?? Promise.resolve();
+    let release = () => undefined;
+    const turn = new Promise((resolve) => {
+        release = resolve;
+    });
+    const queued = previous.then(() => turn);
+    barrelUpdateQueues.set(key, queued);
+    await previous;
+    try {
+        return await regenerateBarrelInternal(barrelFolderUri, createIfMissing);
+    }
+    finally {
+        release();
+        if (barrelUpdateQueues.get(key) === queued) {
+            barrelUpdateQueues.delete(key);
+        }
+    }
+}
+async function regenerateBarrelInternal(barrelFolderUri, createIfMissing = false) {
     const exists = await barrelExists(barrelFolderUri);
     if (!exists && !createIfMissing) {
         return false;
@@ -117,10 +138,7 @@ async function regenerateBarrel(barrelFolderUri, createIfMissing = false) {
         if (!applied) {
             throw new Error(`Could not update ${indexUri.fsPath}`);
         }
-        const saved = await openDocument.save();
-        if (!saved) {
-            throw new Error(`Could not save ${indexUri.fsPath}`);
-        }
+        // Leave open barrels dirty so VS Code saves normally.
         return true;
     }
     await vscode.workspace.fs.writeFile(indexUri, new node_util_1.TextEncoder().encode(contents));
@@ -347,25 +365,28 @@ function getFileName(uri) {
 function sameUri(left, right) {
     return left.toString() === right.toString();
 }
+exports.GENERATED_EXPORTS_MARKER = "// Generated exports";
+exports.CUSTOM_EXPORTS_MARKER = "// Custom exports";
 function mergeBarrelContents(existingContents, generatedExportLines) {
-    if (!existingContents) {
-        const uniqueGeneratedLines = [...new Set(generatedExportLines)].sort((left, right) => left.localeCompare(right));
-        return withTrailingNewline(uniqueGeneratedLines.join("\n"));
+    const uniqueGeneratedLines = [...new Set(generatedExportLines)].sort((left, right) => left.localeCompare(right));
+    let customSection = exports.CUSTOM_EXPORTS_MARKER;
+    if (existingContents) {
+        const normalizedContents = existingContents.replace(/\r\n/g, "\n");
+        const customMarkerIndex = normalizedContents.indexOf(exports.CUSTOM_EXPORTS_MARKER);
+        if (customMarkerIndex >= 0) {
+            customSection = normalizedContents
+                .slice(customMarkerIndex)
+                .replace(/\n$/, "");
+        }
     }
-    const existingText = existingContents.replace(/\r?\n$/, "");
-    const existingLines = new Set(existingText
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean));
-    const missingGeneratedLines = [...new Set(generatedExportLines)]
-        .filter((line) => !existingLines.has(line.trim()))
-        .sort((left, right) => left.localeCompare(right));
-    if (missingGeneratedLines.length === 0) {
-        return withTrailingNewline(existingText);
-    }
-    return withTrailingNewline([existingText, ...missingGeneratedLines].filter(Boolean).join("\n"));
+    const generatedSection = [
+        exports.GENERATED_EXPORTS_MARKER,
+        ...uniqueGeneratedLines,
+    ].join("\n");
+    return withTrailingNewline(`${generatedSection}\n\n${customSection}`);
 }
 function withTrailingNewline(value) {
     return value.length > 0 ? `${value}\n` : "";
 }
+const barrelUpdateQueues = new Map();
 //# sourceMappingURL=barrel-generator.js.map

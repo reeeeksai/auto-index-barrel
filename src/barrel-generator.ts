@@ -42,6 +42,34 @@ export async function regenerateBarrel(
   barrelFolderUri: vscode.Uri,
   createIfMissing = false,
 ): Promise<boolean> {
+  const key = barrelFolderUri.toString();
+  const previous = barrelUpdateQueues.get(key) ?? Promise.resolve();
+
+  let release: () => void = () => undefined;
+  const turn = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  const queued = previous.then(() => turn);
+  barrelUpdateQueues.set(key, queued);
+
+  await previous;
+
+  try {
+    return await regenerateBarrelInternal(barrelFolderUri, createIfMissing);
+  } finally {
+    release();
+
+    if (barrelUpdateQueues.get(key) === queued) {
+      barrelUpdateQueues.delete(key);
+    }
+  }
+}
+
+async function regenerateBarrelInternal(
+  barrelFolderUri: vscode.Uri,
+  createIfMissing = false,
+): Promise<boolean> {
   const exists = await barrelExists(barrelFolderUri);
 
   if (!exists && !createIfMissing) {
@@ -58,62 +86,87 @@ export async function regenerateBarrel(
     (exportPath) => `export * from './${exportPath}';`,
   );
 
-  let existingContents: string | undefined;
-
-  try {
-    const openDocument = vscode.workspace.textDocuments.find(
-      (document) =>
-        document.uri.toString() ===
-        vscode.Uri.joinPath(barrelFolderUri, INDEX_FILE_NAME).toString(),
+  const indexUri = vscode.Uri.joinPath(barrelFolderUri, INDEX_FILE_NAME);
+  const findOpenDocument = () =>
+    vscode.workspace.textDocuments.find((document) =>
+      sameUri(document.uri, indexUri),
     );
 
-    if (openDocument) {
-      existingContents = openDocument.getText();
-    } else {
-      const indexUri = vscode.Uri.joinPath(barrelFolderUri, INDEX_FILE_NAME);
-      const currentBytes = await vscode.workspace.fs.readFile(indexUri);
-      existingContents = new TextDecoder().decode(currentBytes);
+  let openDocument = findOpenDocument();
+  let diskContents: Uint8Array | undefined;
+  if (!openDocument) {
+    try {
+      diskContents = await vscode.workspace.fs.readFile(indexUri);
+    } catch (error) {
+      if (
+        !createIfMissing ||
+        !(error instanceof vscode.FileSystemError) ||
+        error.code !== "FileNotFound"
+      ) {
+        throw error;
+      }
     }
-  } catch {
-    // index.ts may not exist yet.
+    openDocument = findOpenDocument();
   }
 
-  const contents = mergeBarrelContents(existingContents, exportLines);
-
-  const indexUri = vscode.Uri.joinPath(barrelFolderUri, INDEX_FILE_NAME);
-
-  const openDocument = vscode.workspace.textDocuments.find(
-    (document) => document.uri.toString() === indexUri.toString(),
-  );
-
   if (openDocument) {
+    const wasDirty = openDocument.isDirty;
+    const version = openDocument.version;
     const currentContents = openDocument.getText();
-
-    if (currentContents === contents) {
+    const contents = mergeBarrelContents(currentContents, exportLines);
+    if (contents === currentContents) {
       return true;
     }
 
-    const range = new vscode.Range(
-      openDocument.positionAt(0),
-      openDocument.positionAt(currentContents.length),
-    );
-
     const edit = new vscode.WorkspaceEdit();
-    edit.replace(indexUri, range, contents);
-
-    const applied = await vscode.workspace.applyEdit(edit);
-
-    if (!applied) {
+    edit.replace(
+      indexUri,
+      new vscode.Range(
+        openDocument.positionAt(0),
+        openDocument.positionAt(currentContents.length),
+      ),
+      contents,
+    );
+    if (!(await vscode.workspace.applyEdit(edit))) {
       throw new Error(`Could not update ${indexUri.fsPath}`);
     }
 
-    const saved = await openDocument.save();
-
-    if (!saved) {
-      throw new Error(`Could not save ${indexUri.fsPath}`);
+    // Persist generated changes only if they are the sole edit since the snapshot.
+    const documentEol =
+      openDocument.eol === vscode.EndOfLine.CRLF ? "\r\n" : "\n";
+    if (
+      !wasDirty &&
+      !openDocument.isClosed &&
+      openDocument.isDirty &&
+      openDocument.version === version + 1 &&
+      openDocument.getText() === contents.replace(/\r?\n/g, documentEol)
+    ) {
+      if (!(await openDocument.save())) {
+        throw new Error(`Could not save ${indexUri.fsPath}`);
+      }
     }
-
     return true;
+  }
+
+  const existingContents =
+    diskContents &&
+    new TextDecoder("utf-8", {
+      ignoreBOM: true,
+    }).decode(diskContents);
+  const contents = mergeBarrelContents(existingContents, exportLines);
+  if (contents === existingContents) {
+    return true;
+  }
+
+  if (!diskContents) {
+    const edit = new vscode.WorkspaceEdit();
+    edit.createFile(indexUri, { contents: new TextEncoder().encode(contents) });
+    return vscode.workspace.applyEdit(edit);
+  }
+
+  const latestContents = await vscode.workspace.fs.readFile(indexUri);
+  if (findOpenDocument() || !Buffer.from(latestContents).equals(diskContents)) {
+    return false;
   }
 
   await vscode.workspace.fs.writeFile(
@@ -286,13 +339,22 @@ function findAffectedBarrelFolders(
   const folders = new Map<string, vscode.Uri>();
 
   for (const changedUri of changedUris) {
-    const containingFolder = parentUri(changedUri);
-    const parentFolder = parentUri(containingFolder);
+    const workspaceRoot = vscode.workspace.getWorkspaceFolder(changedUri)?.uri;
+    if (!workspaceRoot) {
+      continue;
+    }
 
-    folders.set(containingFolder.toString(), containingFolder);
-
-    if (!sameUri(parentFolder, containingFolder)) {
-      folders.set(parentFolder.toString(), parentFolder);
+    let folder = parentUri(changedUri);
+    while (
+      folder.path === workspaceRoot.path ||
+      folder.path.startsWith(workspaceRoot.path.replace(/\/$/, "") + "/")
+    ) {
+      folders.set(folder.toString(), folder);
+      const parent = parentUri(folder);
+      if (sameUri(folder, workspaceRoot) || sameUri(folder, parent)) {
+        break;
+      }
+      folder = parent;
     }
   }
 
@@ -475,39 +537,36 @@ function sameUri(left: vscode.Uri, right: vscode.Uri): boolean {
   return left.toString() === right.toString();
 }
 
+export const GENERATED_EXPORTS_MARKER = "// Generated exports";
+export const CUSTOM_EXPORTS_MARKER = "// Custom exports";
+
 export function mergeBarrelContents(
   existingContents: string | undefined,
   generatedExportLines: string[],
 ): string {
-  if (!existingContents) {
-    const uniqueGeneratedLines = [...new Set(generatedExportLines)].sort(
-      (left, right) => left.localeCompare(right),
-    );
-
-    return withTrailingNewline(uniqueGeneratedLines.join("\n"));
-  }
-
-  const existingText = existingContents.replace(/\r?\n$/, "");
-  const existingLines = new Set(
-    existingText
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean),
+  const eol = existingContents?.match(/\r?\n/)?.[0] ?? "\n";
+  const bom = existingContents?.startsWith("\uFEFF") ? "\uFEFF" : "";
+  const previous = existingContents?.slice(bom.length) ?? "";
+  const marker = /^[ \t]*\/\/ Custom exports[ \t]*(?=\r?$)/m.exec(previous);
+  const isGenerated = /^[ \t]*\/\/ Generated exports[ \t]*(?=\r?$)/m.test(
+    previous,
   );
+  const customSection = marker
+    ? previous.slice(marker.index)
+    : CUSTOM_EXPORTS_MARKER + eol + (isGenerated ? "" : previous);
 
-  const missingGeneratedLines = [...new Set(generatedExportLines)]
-    .filter((line) => !existingLines.has(line.trim()))
+  const customLines = new Set(
+    customSection.split(/\r?\n/).map((line) => line.trim()),
+  );
+  const uniqueGeneratedLines = [...new Set(generatedExportLines)]
+    .filter((line) => !customLines.has(line))
     .sort((left, right) => left.localeCompare(right));
+  const generatedSection = [
+    GENERATED_EXPORTS_MARKER,
+    ...uniqueGeneratedLines,
+  ].join(eol);
 
-  if (missingGeneratedLines.length === 0) {
-    return withTrailingNewline(existingText);
-  }
-
-  return withTrailingNewline(
-    [existingText, ...missingGeneratedLines].filter(Boolean).join("\n"),
-  );
+  return bom + generatedSection + eol + eol + customSection;
 }
 
-function withTrailingNewline(value: string): string {
-  return value.length > 0 ? `${value}\n` : "";
-}
+const barrelUpdateQueues = new Map<string, Promise<void>>();

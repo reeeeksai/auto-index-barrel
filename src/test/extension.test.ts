@@ -1,26 +1,25 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { mergeBarrelContents } from "../barrel-generator";
+import { mergeBarrelContents, regenerateBarrel } from "../barrel-generator";
 
 suite("Barrel generator", () => {
   test("preserves custom exports and comments when refreshing barrel", () => {
     const existing =
-      "// public API\nexport { Legacy } from './legacy';\nexport * from './old';\n";
+      "// Generated exports\nexport * from './old';\n\n// Custom exports\n// public API\nexport { Legacy } from './legacy';\n";
     const result = mergeBarrelContents(existing, ["export * from './new';"]);
 
     assert.ok(result.includes("// public API"));
     assert.ok(result.includes("export { Legacy } from './legacy';"));
     assert.ok(result.includes("export * from './new';"));
-    assert.ok(result.includes("export * from './old';"));
+    assert.ok(!result.includes("export * from './old';"));
   });
 
   test("preserves custom relative exports and comments when refreshing barrel", () => {
     const existing =
-      "// public API\nexport { Legacy } from './legacy';\nexport * from '../services/action-form.service';\nexport * from '../../../features/actions/compression';\n";
+      "// Generated exports\nexport * from './old';\n\n// Custom exports\n// public API\nexport * from '../services/action-form.service';\nexport * from '../../../features/actions/compression';\n";
     const result = mergeBarrelContents(existing, ["export * from './new';"]);
 
     assert.ok(result.includes("// public API"));
-    assert.ok(result.includes("export { Legacy } from './legacy';"));
     assert.ok(
       result.includes("export * from '../services/action-form.service';"),
     );
@@ -32,7 +31,7 @@ suite("Barrel generator", () => {
 
   test("handles CRLF and duplicate generated exports", () => {
     const existing =
-      "// API\r\nexport * from './one';\r\nexport * from './one';\r\n";
+      "// Generated exports\r\nexport * from './one';\r\nexport * from './one';\r\n\r\n// Custom exports\r\n// API\r\n";
     const result = mergeBarrelContents(existing, [
       "export * from './one';",
       "export * from './two';",
@@ -41,12 +40,12 @@ suite("Barrel generator", () => {
     assert.ok(result.includes("// API"));
     assert.ok(result.includes("export * from './one';"));
     assert.ok(result.includes("export * from './two';"));
-    assert.strictEqual(result.match(/export \* from '\.\/one';/g)?.length, 2);
+    assert.strictEqual(result.match(/export \* from '\.\/one';/g)?.length, 1);
   });
 
   test("preserves custom named exports and comments verbatim", () => {
     const existing =
-      "// Keep this comment\nexport { Special } from '../features/special';\n";
+      "// Generated exports\nexport * from './old';\n\n// Custom exports\n// Keep this comment\nexport { Special } from '../features/special';\n";
     const result = mergeBarrelContents(existing, [
       "export * from './generated';",
     ]);
@@ -59,7 +58,8 @@ suite("Barrel generator", () => {
   });
 
   test("preserves nested barrel paths", () => {
-    const existing = "export * from '../../../features/actions/compression';\n";
+    const existing =
+      "// Generated exports\n\n// Custom exports\nexport * from '../../../features/actions/compression';\n";
     const result = mergeBarrelContents(existing, [
       "export * from './nested/nested.service';",
     ]);
@@ -71,7 +71,8 @@ suite("Barrel generator", () => {
   });
 
   test("preserves deep relative compression barrel export", () => {
-    const existing = "export * from '../../../features/actions/compression';\n";
+    const existing =
+      "// Generated exports\n\n// Custom exports\nexport * from '../../../features/actions/compression';\n";
     const result = mergeBarrelContents(existing, [
       "export * from './consumer';",
     ]);
@@ -80,6 +81,31 @@ suite("Barrel generator", () => {
       result.includes("export * from '../../../features/actions/compression';"),
     );
     assert.ok(result.includes("export * from './consumer';"));
+  });
+
+  test("replaces stale generated exports and preserves custom exports", () => {
+    const existing =
+      "// Generated exports\nexport * from './moved.service';\nexport * from './old.service';\n\n// Custom exports\nexport * from '../shared/custom.service';\n";
+    const result = mergeBarrelContents(existing, [
+      "export * from './current.service';",
+    ]);
+
+    assert.ok(result.includes("// Generated exports"));
+    assert.ok(result.includes("export * from './current.service';"));
+    assert.ok(!result.includes("export * from './moved.service';"));
+    assert.ok(!result.includes("export * from './old.service';"));
+    assert.ok(result.includes("// Custom exports"));
+    assert.ok(result.includes("export * from '../shared/custom.service';"));
+  });
+
+  test("always includes the custom exports section", () => {
+    const result = mergeBarrelContents(undefined, [
+      "export * from './current.service';",
+    ]);
+
+    assert.ok(result.includes("// Generated exports"));
+    assert.ok(result.includes("export * from './current.service';"));
+    assert.ok(result.endsWith("// Custom exports\n"));
   });
 });
 
@@ -104,5 +130,70 @@ suite("Production configuration", () => {
       ].default,
       true,
     );
+  });
+});
+
+suite("Save race integration", () => {
+  test("keeps an open barrel editable without stale save conflicts", async () => {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+
+    if (!workspaceFolder) {
+      return;
+    }
+
+    const folderUri = vscode.Uri.joinPath(
+      workspaceFolder.uri,
+      "save-race-temp",
+    );
+    await vscode.workspace.fs.createDirectory(folderUri);
+
+    const indexUri = vscode.Uri.joinPath(folderUri, "index.ts");
+    await vscode.workspace.fs.writeFile(
+      indexUri,
+      new TextEncoder().encode("// Generated exports\n// Custom exports\n"),
+    );
+
+    const document = await vscode.workspace.openTextDocument(indexUri);
+    await vscode.window.showTextDocument(document);
+
+    const firstUri = vscode.Uri.joinPath(folderUri, "first.service.ts");
+    const secondUri = vscode.Uri.joinPath(folderUri, "second.service.ts");
+    await vscode.workspace.fs.writeFile(
+      firstUri,
+      new TextEncoder().encode("export class FirstService {}\n"),
+    );
+
+    await Promise.all([
+      regenerateBarrel(folderUri, false),
+      regenerateBarrel(folderUri, false),
+    ]);
+
+    assert.strictEqual(document.isDirty, false);
+    const saved = new TextDecoder().decode(
+      await vscode.workspace.fs.readFile(indexUri),
+    );
+    assert.ok(saved.includes("export * from './first.service';"));
+
+    const manualEdit = new vscode.WorkspaceEdit();
+    manualEdit.insert(
+      indexUri,
+      document.positionAt(document.getText().length),
+      "// Manual edit\n",
+    );
+    assert.strictEqual(await vscode.workspace.applyEdit(manualEdit), true);
+
+    await vscode.workspace.fs.rename(firstUri, secondUri);
+    await regenerateBarrel(folderUri, false);
+
+    assert.strictEqual(document.isDirty, true);
+    assert.ok(document.getText().includes("// Manual edit"));
+    assert.ok(document.getText().includes("export * from './second.service';"));
+    assert.ok(!document.getText().includes("export * from './first.service';"));
+    assert.strictEqual(
+      new TextDecoder().decode(await vscode.workspace.fs.readFile(indexUri)),
+      saved,
+    );
+    assert.strictEqual(await document.save(), true);
+    await vscode.workspace.fs.delete(folderUri, { recursive: true });
   });
 });
