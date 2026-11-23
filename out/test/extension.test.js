@@ -34,15 +34,63 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 const assert = __importStar(require("assert"));
-// You can import and use all API from the 'vscode' module
-// as well as import your extension to test it
-const vscode = __importStar(require("vscode"));
-// import * as myExtension from '../../extension';
-suite('Extension Test Suite', () => {
-    vscode.window.showInformationMessage('Start all tests.');
-    test('Sample test', () => {
-        assert.strictEqual(-1, [1, 2, 3].indexOf(5));
-        assert.strictEqual(-1, [1, 2, 3].indexOf(0));
+const barrel_generator_1 = require("../barrel-generator");
+suite('Barrel generator', () => {
+    test('preserves custom exports and comments when refreshing barrel', () => {
+        const existing = "// public API\nexport { Legacy } from './legacy';\nexport * from './old';\n";
+        const result = (0, barrel_generator_1.mergeBarrelContents)(existing, ["export * from './new';"]);
+        assert.ok(result.includes("// public API"));
+        assert.ok(result.includes("export { Legacy } from './legacy';"));
+        assert.ok(result.includes("export * from './new';"));
+        assert.ok(result.includes("export * from './old';"));
+    });
+    test('preserves custom relative exports and comments when refreshing barrel', () => {
+        const existing = "// public API\nexport { Legacy } from './legacy';\nexport * from '../services/action-form.service';\nexport * from '../../../features/actions/compression';\n";
+        const result = (0, barrel_generator_1.mergeBarrelContents)(existing, ["export * from './new';"]);
+        assert.ok(result.includes("// public API"));
+        assert.ok(result.includes("export { Legacy } from './legacy';"));
+        assert.ok(result.includes("export * from '../services/action-form.service';"));
+        assert.ok(result.includes("export * from '../../../features/actions/compression';"));
+        assert.ok(result.includes("export * from './new';"));
+    });
+    test('handles CRLF and duplicate generated exports', () => {
+        const existing = "// API\r\nexport * from './one';\r\nexport * from './one';\r\n";
+        const result = (0, barrel_generator_1.mergeBarrelContents)(existing, [
+            "export * from './one';",
+            "export * from './two';",
+        ]);
+        assert.ok(result.includes("// API"));
+        assert.ok(result.includes("export * from './one';"));
+        assert.ok(result.includes("export * from './two';"));
+        assert.strictEqual(result.match(/export \* from '\.\/one';/g)?.length, 2);
+    });
+    test('preserves custom named exports and comments verbatim', () => {
+        const existing = "// Keep this comment\nexport { Special } from '../features/special';\n";
+        const result = (0, barrel_generator_1.mergeBarrelContents)(existing, ["export * from './generated';"]);
+        assert.ok(result.includes("// Keep this comment"));
+        assert.ok(result.includes("export { Special } from '../features/special';"));
+        assert.ok(result.includes("export * from './generated';"));
+    });
+    test('preserves nested barrel paths', () => {
+        const existing = "export * from '../../../features/actions/compression';\n";
+        const result = (0, barrel_generator_1.mergeBarrelContents)(existing, ["export * from './nested/nested.service';"]);
+        assert.ok(result.includes("export * from './nested/nested.service';"));
+        assert.ok(result.includes("export * from '../../../features/actions/compression';"));
+    });
+    test('preserves deep relative compression barrel export', () => {
+        const existing = "export * from '../../../features/actions/compression';\n";
+        const result = (0, barrel_generator_1.mergeBarrelContents)(existing, ["export * from './consumer';"]);
+        assert.ok(result.includes("export * from '../../../features/actions/compression';"));
+        assert.ok(result.includes("export * from './consumer';"));
+    });
+});
+suite('Production configuration', () => {
+    test('enables safe on-save rewriting by default', () => {
+        const fs = require('fs');
+        const path = require('path');
+        const packageJsonPath = path.resolve(__dirname, '../../package.json');
+        const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+        assert.strictEqual(packageJson.contributes.configuration.properties['autoIndexBarrel.rewriteImportsOnSave'].default, true);
     });
 });
 //# sourceMappingURL=extension.test.js.map

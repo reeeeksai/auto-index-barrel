@@ -206,6 +206,15 @@ async function findImportReplacements(
       continue;
     }
 
+    const importedNames = getImportedNames(statement.importClause);
+
+    if (
+      importedNames.length > 0 &&
+      !(await targetExportsAnyImportedName(targetFileUri, importedNames))
+    ) {
+      continue;
+    }
+
     const newSpecifier = createBarrelModuleSpecifier(
       document.uri,
       originalSpecifier,
@@ -289,6 +298,35 @@ async function findExportingBarrel(
     }
 
     candidateFolder = nextFolder;
+  }
+
+  const barrelIndexFiles = await vscode.workspace.findFiles(
+    new vscode.RelativePattern(workspaceFolder.uri, "**/index.ts"),
+    EXCLUDED_GLOB,
+  );
+
+  barrelIndexFiles.sort((left, right) =>
+    left.fsPath.localeCompare(right.fsPath, undefined, {
+      sensitivity: "base",
+      numeric: true,
+    }),
+  );
+
+  for (const indexUri of barrelIndexFiles) {
+    const barrelFolder = parentUri(indexUri);
+
+    if (isInsideOrEqual(barrelFolder, importerUri)) {
+      continue;
+    }
+
+    if (
+      await barrelExportsFile(indexUri, importedFileUri, projectConfiguration)
+    ) {
+      return {
+        folderUri: barrelFolder,
+        indexUri,
+      };
+    }
   }
 
   return undefined;
@@ -749,4 +787,113 @@ function sameUri(left: vscode.Uri, right: vscode.Uri): boolean {
   }
 
   return left.toString() === right.toString();
+}
+
+function getImportedNames(importClause: ts.ImportClause): string[] {
+  const names: string[] = [];
+
+  if (importClause.name) {
+    names.push("default");
+  }
+
+  if (
+    importClause.namedBindings &&
+    ts.isNamedImports(importClause.namedBindings)
+  ) {
+    for (const element of importClause.namedBindings.elements) {
+      names.push(element.propertyName?.text ?? element.name.text);
+    }
+  }
+
+  return [...new Set(names)];
+}
+
+async function targetExportsAnyImportedName(
+  targetFileUri: vscode.Uri,
+  importedNames: readonly string[],
+): Promise<boolean> {
+  try {
+    const bytes = await vscode.workspace.fs.readFile(targetFileUri);
+    const sourceFile = ts.createSourceFile(
+      targetFileUri.fsPath,
+      new TextDecoder().decode(bytes),
+      ts.ScriptTarget.Latest,
+      true,
+      getScriptKind(targetFileUri),
+    );
+
+    const exportedNames = new Set<string>();
+
+    for (const statement of sourceFile.statements) {
+      if (ts.isExportDeclaration(statement)) {
+        if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+          for (const element of statement.exportClause.elements) {
+            exportedNames.add(element.name.text);
+          }
+        }
+        continue;
+      }
+
+      if (ts.isExportAssignment(statement)) {
+        exportedNames.add("default");
+      }
+
+      if (
+        (ts.isVariableStatement(statement) ||
+          ts.isFunctionDeclaration(statement) ||
+          ts.isClassDeclaration(statement) ||
+          ts.isInterfaceDeclaration(statement) ||
+          ts.isTypeAliasDeclaration(statement) ||
+          ts.isEnumDeclaration(statement) ||
+          ts.isModuleDeclaration(statement)) &&
+        statement.modifiers?.some(
+          (modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword,
+        )
+      ) {
+        if (ts.isVariableStatement(statement)) {
+          for (const declaration of statement.declarationList.declarations) {
+            if (ts.isIdentifier(declaration.name)) {
+              exportedNames.add(declaration.name.text);
+            }
+          }
+        } else if (statement.name) {
+          exportedNames.add(statement.name.text);
+        }
+      }
+    }
+
+    return importedNames.some((name) => exportedNames.has(name));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Preview shape for import updates.
+ */
+export interface ImportRewritePreview {
+  fileUri: vscode.Uri;
+  line: number;
+  originalSpecifier: string;
+  newSpecifier: string;
+}
+
+/**
+ * Preview import rewrites in one TypeScript document.
+ */
+export async function previewImportRewritesInDocument(
+  document: vscode.TextDocument,
+): Promise<ImportRewritePreview[]> {
+  if (!isSupportedDocument(document)) {
+    return [];
+  }
+
+  const replacements = await findImportReplacements(document);
+
+  return replacements.map((replacement) => ({
+    fileUri: document.uri,
+    line: replacement.range.start.line + 1,
+    originalSpecifier: document.getText(replacement.range),
+    newSpecifier: replacement.newModuleSpecifier,
+  }));
 }

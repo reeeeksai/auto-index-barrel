@@ -1,7 +1,10 @@
 import * as vscode from "vscode";
 import { TextDecoder, TextEncoder } from "node:util";
+import * as ts from "typescript";
 
 const INDEX_FILE_NAME = "index.ts";
+
+const TYPESCRIPT_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts"];
 
 const EXCLUDED_FOLDERS = new Set([
   "node_modules",
@@ -55,8 +58,27 @@ export async function regenerateBarrel(
     (exportPath) => `export * from './${exportPath}';`,
   );
 
-  const contents =
-    exportLines.join("\n") + (exportLines.length > 0 ? "\n" : "");
+  let existingContents: string | undefined;
+
+  try {
+    const openDocument = vscode.workspace.textDocuments.find(
+      (document) =>
+        document.uri.toString() ===
+        vscode.Uri.joinPath(barrelFolderUri, INDEX_FILE_NAME).toString(),
+    );
+
+    if (openDocument) {
+      existingContents = openDocument.getText();
+    } else {
+      const indexUri = vscode.Uri.joinPath(barrelFolderUri, INDEX_FILE_NAME);
+      const currentBytes = await vscode.workspace.fs.readFile(indexUri);
+      existingContents = new TextDecoder().decode(currentBytes);
+    }
+  } catch {
+    // index.ts may not exist yet.
+  }
+
+  const contents = mergeBarrelContents(existingContents, exportLines);
 
   const indexUri = vscode.Uri.joinPath(barrelFolderUri, INDEX_FILE_NAME);
 
@@ -92,18 +114,6 @@ export async function regenerateBarrel(
     }
 
     return true;
-  }
-
-  try {
-    const currentBytes = await vscode.workspace.fs.readFile(indexUri);
-
-    const currentContents = new TextDecoder().decode(currentBytes);
-
-    if (currentContents === contents) {
-      return true;
-    }
-  } catch {
-    // index.ts may not exist yet.
   }
 
   await vscode.workspace.fs.writeFile(
@@ -318,8 +328,7 @@ async function collectExportPaths(
     }
 
     const childFolderUri = vscode.Uri.joinPath(barrelFolderUri, name);
-
-    const childExports = await collectDirectChildExports(childFolderUri, name);
+    const childExports = await collectRecursiveExportPaths(childFolderUri, name);
 
     exportPaths.push(...childExports);
   }
@@ -327,34 +336,46 @@ async function collectExportPaths(
   return exportPaths;
 }
 
-async function collectDirectChildExports(
-  childFolderUri: vscode.Uri,
-  childFolderName: string,
+async function collectRecursiveExportPaths(
+  barrelFolderUri: vscode.Uri,
+  relativeFolderName: string,
 ): Promise<string[]> {
   let entries: [string, vscode.FileType][];
 
   try {
-    entries = await vscode.workspace.fs.readDirectory(childFolderUri);
+    entries = await vscode.workspace.fs.readDirectory(barrelFolderUri);
   } catch {
     return [];
   }
 
   const exportPaths: string[] = [];
 
-  for (const [fileName, type] of entries) {
-    if (type !== vscode.FileType.File) {
+  for (const [name, type] of entries) {
+    if (type === vscode.FileType.File) {
+      const exportPath = await getExportPath(
+        barrelFolderUri,
+        name,
+        relativeFolderName,
+      );
+
+      if (exportPath) {
+        exportPaths.push(exportPath);
+      }
+
       continue;
     }
 
-    const exportPath = await getExportPath(
+    if (type !== vscode.FileType.Directory || shouldIgnoreFolder(name)) {
+      continue;
+    }
+
+    const childFolderUri = vscode.Uri.joinPath(barrelFolderUri, name);
+    const childExports = await collectRecursiveExportPaths(
       childFolderUri,
-      fileName,
-      childFolderName,
+      `${relativeFolderName}/${name}`,
     );
 
-    if (exportPath) {
-      exportPaths.push(exportPath);
-    }
+    exportPaths.push(...childExports);
   }
 
   return exportPaths;
@@ -395,22 +416,40 @@ async function fileHasExports(fileUri: vscode.Uri): Promise<boolean> {
 }
 
 function hasExportStatement(source: string): boolean {
-  return (
-    /\bexport\s+(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:class|interface|type|enum|const|let|var|function|namespace|module)\b/.test(
-      source,
-    ) ||
-    /\bexport\s*\{/.test(source) ||
-    /\bexport\s*\*/.test(source) ||
-    /\bexport\s+default\b/.test(source)
+  const sourceFile = ts.createSourceFile(
+    "candidate.ts",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
   );
+
+  return sourceFile.statements.some((statement) => {
+    if (ts.isExportDeclaration(statement)) {
+      return true;
+    }
+
+    return (
+      (ts.isVariableStatement(statement) ||
+        ts.isFunctionDeclaration(statement) ||
+        ts.isClassDeclaration(statement) ||
+        ts.isInterfaceDeclaration(statement) ||
+        ts.isTypeAliasDeclaration(statement) ||
+        ts.isEnumDeclaration(statement) ||
+        ts.isModuleDeclaration(statement)) &&
+      statement.modifiers?.some(
+        (modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword,
+      ) === true
+    );
+  });
 }
 
 function shouldConsiderFile(fileName: string): boolean {
   const lowerName = fileName.toLowerCase();
 
   return (
-    lowerName.endsWith(".ts") &&
-    lowerName !== INDEX_FILE_NAME &&
+    TYPESCRIPT_EXTENSIONS.some((extension) => lowerName.endsWith(extension)) &&
+    !/^index\.(?:tsx?|mts|cts)$/i.test(lowerName) &&
     !lowerName.endsWith(".spec.ts") &&
     !lowerName.endsWith(".test.ts") &&
     !lowerName.endsWith(".d.ts")
@@ -422,7 +461,7 @@ function shouldIgnoreFolder(folderName: string): boolean {
 }
 
 function removeTsExtension(fileName: string): string {
-  return fileName.slice(0, -".ts".length);
+  return fileName.replace(/\.(?:tsx?|mts|cts)$/i, "");
 }
 
 function getFileName(uri: vscode.Uri): string | undefined {
@@ -431,4 +470,41 @@ function getFileName(uri: vscode.Uri): string | undefined {
 
 function sameUri(left: vscode.Uri, right: vscode.Uri): boolean {
   return left.toString() === right.toString();
+}
+
+export function mergeBarrelContents(
+  existingContents: string | undefined,
+  generatedExportLines: string[],
+): string {
+  if (!existingContents) {
+    const uniqueGeneratedLines = [...new Set(generatedExportLines)].sort((left, right) =>
+      left.localeCompare(right),
+    );
+
+    return withTrailingNewline(uniqueGeneratedLines.join("\n"));
+  }
+
+  const existingText = existingContents.replace(/\r?\n$/, "");
+  const existingLines = new Set(
+    existingText
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean),
+  );
+
+  const missingGeneratedLines = [...new Set(generatedExportLines)]
+    .filter((line) => !existingLines.has(line.trim()))
+    .sort((left, right) => left.localeCompare(right));
+
+  if (missingGeneratedLines.length === 0) {
+    return withTrailingNewline(existingText);
+  }
+
+  return withTrailingNewline(
+    [existingText, ...missingGeneratedLines].filter(Boolean).join("\n"),
+  );
+}
+
+function withTrailingNewline(value: string): string {
+  return value.length > 0 ? `${value}\n` : "";
 }

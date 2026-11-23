@@ -19,10 +19,7 @@
     "angular"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:autoIndexBarrel.regenerateAll",
-    "onCommand:autoIndexBarrel.createMissingBarrels",
-    "onCommand:autoIndexBarrel.regenerateAllImports"
+    "onStartupFinished"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -59,9 +56,7 @@
         "autoIndexBarrel.rewriteImportsOnSave": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Automatically rewrites safe direct TypeScript imports to use an available barrel when the importing file is saved.",
-          "scope": "resource",
-          "order": 2
+          "markdownDescription": "Automatically rewrites safe direct TypeScript imports to use an available barrel when the importing file is saved."
         }
       }
     },

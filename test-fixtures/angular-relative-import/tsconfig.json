@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "target": "ES2022",
+    "strict": true,
+    "paths": {
+      "@features/*": ["src/app/features/*"]
+    },
+    "ignoreDeprecations": "5.0"
+  }
+}
