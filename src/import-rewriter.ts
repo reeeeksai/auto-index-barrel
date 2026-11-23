@@ -826,7 +826,10 @@ async function targetExportsAnyImportedName(
 
     for (const statement of sourceFile.statements) {
       if (ts.isExportDeclaration(statement)) {
-        if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+        if (
+          statement.exportClause &&
+          ts.isNamedExports(statement.exportClause)
+        ) {
           for (const element of statement.exportClause.elements) {
             exportedNames.add(element.name.text);
           }

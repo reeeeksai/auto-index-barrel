@@ -328,7 +328,10 @@ async function collectExportPaths(
     }
 
     const childFolderUri = vscode.Uri.joinPath(barrelFolderUri, name);
-    const childExports = await collectRecursiveExportPaths(childFolderUri, name);
+    const childExports = await collectRecursiveExportPaths(
+      childFolderUri,
+      name,
+    );
 
     exportPaths.push(...childExports);
   }
@@ -477,8 +480,8 @@ export function mergeBarrelContents(
   generatedExportLines: string[],
 ): string {
   if (!existingContents) {
-    const uniqueGeneratedLines = [...new Set(generatedExportLines)].sort((left, right) =>
-      left.localeCompare(right),
+    const uniqueGeneratedLines = [...new Set(generatedExportLines)].sort(
+      (left, right) => left.localeCompare(right),
     );
 
     return withTrailingNewline(uniqueGeneratedLines.join("\n"));
