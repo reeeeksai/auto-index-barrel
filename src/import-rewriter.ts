@@ -50,6 +50,7 @@ export async function updateImportsInDocument(
     return 0;
   }
 
+  const wasDirty = document.isDirty;
   const workspaceEdit = new vscode.WorkspaceEdit();
 
   for (const replacement of replacements) {
@@ -60,10 +61,24 @@ export async function updateImportsInDocument(
     );
   }
 
+  let expectedText = document.getText();
+  for (const { range, newModuleSpecifier } of [...replacements].reverse()) {
+    const start = document.offsetAt(range.start);
+    const end = document.offsetAt(range.end);
+    expectedText = expectedText.slice(0, start) + newModuleSpecifier + expectedText.slice(end);
+  }
+
   const applied = await vscode.workspace.applyEdit(workspaceEdit);
 
   if (!applied) {
     throw new Error(`Could not update imports in ${document.uri.fsPath}`);
+  }
+
+  // Save only when the rewrite is the sole edit since the document snapshot.
+  if (!wasDirty && !document.isClosed && document.isDirty &&
+      document.version === version + 1 && document.getText() === expectedText &&
+      !(await document.save())) {
+    throw new Error(`Could not save rewritten imports in ${document.uri.fsPath}`);
   }
 
   return replacements.length;
@@ -615,7 +630,7 @@ function createNonRelativeBarrelSpecifier(
   return result || ".";
 }
 
-function findProjectConfiguration(
+export function findProjectConfiguration(
   sourceFilePath: string,
 ): ProjectConfiguration | undefined {
   let directory = path.dirname(sourceFilePath);

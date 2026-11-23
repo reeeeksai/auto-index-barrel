@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { TextDecoder, TextEncoder } from "node:util";
 import * as ts from "typescript";
+import { findProjectConfiguration } from "./import-rewriter";
 
 const INDEX_FILE_NAME = "index.ts";
 
@@ -82,11 +83,8 @@ async function regenerateBarrelInternal(
     left.localeCompare(right),
   );
 
-  const exportLines = uniqueExportPaths.map(
-    (exportPath) => `export * from './${exportPath}';`,
-  );
-
   const indexUri = vscode.Uri.joinPath(barrelFolderUri, INDEX_FILE_NAME);
+  const exportLines = createGeneratedExports(indexUri, uniqueExportPaths);
   const findOpenDocument = () =>
     vscode.workspace.textDocuments.find((document) =>
       sameUri(document.uri, indexUri),
@@ -461,11 +459,7 @@ async function getExportPath(
     return undefined;
   }
 
-  const pathWithoutExtension = removeTsExtension(fileName);
-
-  return relativeFolderName
-    ? `${relativeFolderName}/${pathWithoutExtension}`
-    : pathWithoutExtension;
+  return relativeFolderName ? `${relativeFolderName}/${fileName}` : fileName;
 }
 
 async function fileHasExports(fileUri: vscode.Uri): Promise<boolean> {
@@ -517,16 +511,12 @@ function shouldConsiderFile(fileName: string): boolean {
     !/^index\.(?:tsx?|mts|cts)$/i.test(lowerName) &&
     !lowerName.endsWith(".spec.ts") &&
     !lowerName.endsWith(".test.ts") &&
-    !lowerName.endsWith(".d.ts")
+    !/\.d\.(?:ts|mts|cts)$/.test(lowerName)
   );
 }
 
 function shouldIgnoreFolder(folderName: string): boolean {
   return EXCLUDED_FOLDERS.has(folderName) || folderName.startsWith(".");
-}
-
-function removeTsExtension(fileName: string): string {
-  return fileName.replace(/\.(?:tsx?|mts|cts)$/i, "");
 }
 
 function getFileName(uri: vscode.Uri): string | undefined {
@@ -535,6 +525,110 @@ function getFileName(uri: vscode.Uri): string | undefined {
 
 function sameUri(left: vscode.Uri, right: vscode.Uri): boolean {
   return left.toString() === right.toString();
+}
+
+function createGeneratedExports(indexUri: vscode.Uri, exportPaths: readonly string[]): string[] {
+  const config = indexUri.scheme === "file" ? findProjectConfiguration(indexUri.fsPath) : undefined;
+  const options: ts.CompilerOptions = {
+    ...config?.options ?? {
+      module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.Bundler
+    },
+    noResolve: false,
+    noLib: true,
+    types: []
+  };
+  const nodeModule = options.module === ts.ModuleKind.Node16 || options.module === ts.ModuleKind.Node18 || options.module === ts.ModuleKind.Node20 || options.module === ts.ModuleKind.NodeNext;
+  const indexFormat = nodeModule ? ts.getImpliedNodeFormatForFile(indexUri.fsPath, undefined, ts.sys, options) : undefined;
+  const requiresEsmExtensions = indexFormat === ts.ModuleKind.ESNext && options.moduleResolution !== ts.ModuleResolutionKind.Bundler;
+  const cannotRequireEsm = indexFormat === ts.ModuleKind.CommonJS && (options.module === ts.ModuleKind.Node16 || options.module === ts.ModuleKind.Node18);
+  const starExports = exportPaths.flatMap((exportPath) => {
+    const target = vscode.Uri.joinPath(parentUri(indexUri), exportPath);
+    if (cannotRequireEsm && ts.getImpliedNodeFormatForFile(target.fsPath, undefined, ts.sys, options) === ts.ModuleKind.ESNext) {
+      return [];
+    }
+    const modulePath = exportPath.replace(/\.mts$/i, ".mjs").replace(/\.cts$/i, ".cjs").replace(/\.tsx$/i, requiresEsmExtensions && options.jsx === ts.JsxEmit.Preserve ? ".jsx" : requiresEsmExtensions ? ".js" : "").replace(/\.ts$/i, requiresEsmExtensions ? ".js" : "");
+    return [`export * from './${modulePath.replace(/['\\]/g, "\\$&")}';`];
+  });
+  if (starExports.length < 2 || indexUri.scheme !== "file") {
+    return starExports;
+  }
+  const host = ts.createCompilerHost(options);
+  const getSourceFile = host.getSourceFile.bind(host);
+  const canonicalPath = (fileName: string) => host.getCanonicalFileName(ts.sys.resolvePath(fileName));
+  const indexPath = canonicalPath(indexUri.fsPath);
+  host.getSourceFile = (fileName, version, onError, shouldCreateNewSourceFile) => canonicalPath(fileName) === indexPath ? ts.createSourceFile(fileName, starExports.join("\n"), version, true) : getSourceFile(fileName, version, onError, shouldCreateNewSourceFile);
+  const program = ts.createProgram([indexUri.fsPath], options, host);
+  const source = program.getSourceFile(indexUri.fsPath);
+  if (!source || source.statements.length !== starExports.length) {
+    return starExports;
+  }
+  const checker = program.getTypeChecker();
+  const entries = source.statements.map((statement) => {
+    if (!ts.isExportDeclaration(statement) || !statement.moduleSpecifier) {
+      return [];
+    }
+    const exportedModule = checker.getSymbolAtLocation(statement.moduleSpecifier);
+    return exportedModule ? checker.getExportsOfModule(exportedModule).filter(
+      (symbol) => symbol.getName() !== "default" && symbol.getName() !== "export="
+    ) : [];
+  });
+  const originalSymbol = (symbol: ts.Symbol) => symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+  const origins = new Map<string, ts.Symbol>();
+  const ambiguousNames = new Set<string>();
+  for (const symbols of entries) {
+    for (const symbol of symbols) {
+      const name = symbol.getName();
+      const original = originalSymbol(symbol);
+      const previous = origins.get(name);
+      if (previous && previous !== original) {
+        ambiguousNames.add(name);
+      }
+      origins.set(name, original);
+    }
+  }
+  const printer = ts.createPrinter();
+  return starExports.flatMap((starExport, index) => {
+    const symbols = entries[index];
+    if (!symbols.some((symbol) => ambiguousNames.has(symbol.getName()))) {
+      return [starExport];
+    }
+    const uniqueBindings = symbols.filter((symbol) => !ambiguousNames.has(symbol.getName())).map((symbol) => {
+      const name = symbol.getName();
+      const original = originalSymbol(symbol);
+      const typeOnly = !(original.flags & ts.SymbolFlags.Value) || symbol.declarations?.some(ts.isTypeOnlyImportOrExportDeclaration) === true;
+      const identifier = /^[\p{ID_Start}$_][\p{ID_Continue}$]*$/u.test(name) ? ts.factory.createIdentifier(name) : ts.factory.createStringLiteral(name);
+      return ts.factory.createExportSpecifier(typeOnly, undefined, identifier);
+    });
+    if (uniqueBindings.length === 0) {
+      return [];
+    }
+    const statement = source.statements[index] as ts.ExportDeclaration;
+    const namedExport = ts.factory.updateExportDeclaration(
+      statement,
+      undefined,
+      false,
+      ts.factory.createNamedExports(uniqueBindings),
+      statement.moduleSpecifier,
+      undefined
+    );
+    return [printer.printNode(ts.EmitHint.Unspecified, namedExport, source)];
+  });
+}
+function findBarrelMarker(text: string, marker: string): number | undefined {
+  const source = ts.createSourceFile(INDEX_FILE_NAME, text, ts.ScriptTarget.Latest, true);
+  for (const node of [...source.statements, source.endOfFileToken]) {
+    for (const comment of ts.getLeadingCommentRanges(text, node.pos) ?? []) {
+      if (comment.kind !== ts.SyntaxKind.SingleLineCommentTrivia || text.slice(comment.pos, comment.end).trimEnd() !== marker) {
+        continue;
+      }
+      const lineStart = text.lastIndexOf("\n", comment.pos - 1) + 1;
+      if (/^[ \t]*$/.test(text.slice(lineStart, comment.pos))) {
+        return lineStart;
+      }
+    }
+  }
+  return undefined;
 }
 
 export const GENERATED_EXPORTS_MARKER = "// Generated exports";
@@ -547,12 +641,10 @@ export function mergeBarrelContents(
   const eol = existingContents?.match(/\r?\n/)?.[0] ?? "\n";
   const bom = existingContents?.startsWith("\uFEFF") ? "\uFEFF" : "";
   const previous = existingContents?.slice(bom.length) ?? "";
-  const marker = /^[ \t]*\/\/ Custom exports[ \t]*(?=\r?$)/m.exec(previous);
-  const isGenerated = /^[ \t]*\/\/ Generated exports[ \t]*(?=\r?$)/m.test(
-    previous,
-  );
-  const customSection = marker
-    ? previous.slice(marker.index)
+  const marker = findBarrelMarker(previous, CUSTOM_EXPORTS_MARKER);
+  const isGenerated = findBarrelMarker(previous, GENERATED_EXPORTS_MARKER) === 0;
+  const customSection = marker !== undefined
+    ? previous.slice(marker)
     : CUSTOM_EXPORTS_MARKER + eol + (isGenerated ? "" : previous);
 
   const customLines = new Set(

@@ -220,17 +220,7 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         importRewriteInProgress.add(documentKey);
 
-        const changedImports = await updateImportsInDocument(document);
-
-        if (changedImports === 0) {
-          return;
-        }
-
-        /*
-         * updateImportsInDocument applies a WorkspaceEdit.
-         * Leave the document dirty and let VS Code save it normally,
-         * avoiding stale-content races during rapid saves or moves.
-         */
+        await updateImportsInDocument(document);
       } catch (error) {
         logError(
           output,
@@ -345,7 +335,7 @@ export function activate(context: vscode.ExtensionContext): void {
         {
           modal: true,
           detail:
-            "Direct imports will be changed to barrel imports when a matching index.ts exports the imported file. Editor changes may need to be saved.",
+            "Direct imports will be changed to barrel imports when a matching index.ts exports the imported file. Files with pending edits still need a manual save.",
         },
         "Update Imports",
       );
@@ -395,7 +385,7 @@ export function activate(context: vscode.ExtensionContext): void {
         {
           modal: true,
           detail:
-            "This creates configured missing barrels, regenerates existing barrels, and updates safe direct imports. Editor changes may need to be saved.",
+            "This creates configured missing barrels, regenerates existing barrels, and updates safe direct imports. Files with pending edits still need a manual save.",
         },
         "Regenerate Everything",
       );
